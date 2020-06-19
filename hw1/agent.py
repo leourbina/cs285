@@ -1,8 +1,17 @@
-import gym
+import numpy as np
 import torch
 import torch.nn as nn
-
 from tqdm import tqdm
+
+
+def agent_wrapper(agent, config):
+  def _no_grad_agent(obs):
+    with torch.no_grad():
+      obs = torch.from_numpy(obs).float().to(config.device)
+      return agent(obs).detach().cpu().numpy()
+
+  return _no_grad_agent
+
 
 class Agent(nn.Module):
   """
@@ -37,43 +46,37 @@ class Agent(nn.Module):
     return self.layers(x)
 
 
-def run_agent(agent_file, envname, max_timesteps, num_rollouts=1, render=False, quiet=False):
-  state_dict, n_inputs, n_outputs, hidden_layers = torch.load(agent_file)
-  agent = Agent(n_inputs, n_outputs, hidden_layers)
-  agent.load_state_dict(state_dict)
+def run_agent(agent, config):
+    max_steps = config.max_timesteps or config.env.spec.timestep_limit
 
-  env = gym.make(envname)
-  max_steps = max_timesteps or env.spec.timestep_limit
+    returns = []
+    observations = []
+    actions = []
+    for i in tqdm(range(config.num_rollouts), desc="Rollouts", leave=True):
+        if not config.quiet:
+            print('iter', i)
+        obs = config.env.reset()
+        done = False
+        totalr = 0.
+        steps = 0
+        while not done:
+            action = agent(obs[None, :])
+            observations.append(obs)
+            actions.append(action)
+            obs, r, done, _ = config.env.step(action)
+            totalr += r
+            steps += 1
+            if config.render:
+                config.env.render()
+            if steps % 100 == 0 and not config.quiet:
+                print(f"{steps}/{max_steps}")
+            if steps >= max_steps:
+                break
+        returns.append(totalr)
 
-  returns = []
-  observations = []
+    if not config.quiet:
+        print('returns', returns)
+        print('mean return', np.mean(returns))
+        print('std of return', np.std(returns))
 
-  for i in tqdm(range(num_rollouts)):
-    if not quiet:
-      print('iter', i)
-
-    obs = env.reset()
-    done = False
-    totalr = 0.
-    steps = 0
-
-    while not done:
-      action = agent(obs).detach().cpu().numpy()
-      observations.append(obs)
-
-      obs, r, done, _ = env.step(action)
-
-      totalr += r
-      steps += 1
-
-      if render:
-        env.render()
-      if steps % 100 == 0 and not quiet:
-        print(f"{steps}/{max_steps}")
-
-      if steps >= max_steps:
-        break
-
-    returns.append(totalr)
-
-  return returns
+    return actions, observations, returns

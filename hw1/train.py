@@ -1,4 +1,3 @@
-import pickle
 from tqdm import tqdm
 
 import torch
@@ -6,52 +5,71 @@ import torch.utils.data as data
 import torch.optim as optim
 import torch.nn.functional as F
 
-from agent import Agent
+from agent import Agent, run_agent, agent_wrapper
+from run_expert import run_expert
+from load_policy import load_policy
 
-AGENT_DIR = "./trained_agents"
 
+def train_bc_agent(expert_policy_file, config):
+  # Run expert
+  actions, observations, returns = run_expert(expert_policy_file, config)
 
-def train_bc_agent(expert, epochs=10, lr=5e-5, save=True):
-  expert_data = ExpertData(expert)
+  observations = torch.Tensor(observations).to(config.device)
+  actions = torch.Tensor(actions).squeeze(1).to(config.device)
 
-  split = 0.9
+  expert_data = data.TensorDataset(observations, actions)
+
   N = len(expert_data)
 
-  train_length = int(split * N)
-  test_length = len(expert_data) - train_length
+  train_length = int(config.split * N)
+  test_length = N - train_length
 
   trainset, valset = data.random_split(expert_data, [train_length, test_length])
   train_loader = data.DataLoader(trainset, batch_size=128, shuffle=True)
   test_loader = data.DataLoader(valset, batch_size=128)
 
-  x, y = trainset[0]
+  x, y = expert_data[0]
 
-  agent = Agent(input_size=x.shape[0], output_size=y.shape[0], hidden_layers=[50, 50])
+  agent = Agent(input_size=config.env.observation_space.shape[0], output_size=config.env.action_space.shape[0], hidden_layers=config.hidden_layers)
 
-  train_losses, test_losses = train_epochs(agent, train_loader, test_loader, epochs=epochs, lr=lr)
+  train_losses, test_losses = train_epochs(agent, train_loader, test_loader, epochs=config.epochs, lr=config.lr)
 
-  if save:
-    torch.save((agent.state_dict(), agent.input_size, agent.output_size, agent.hidden_layers), f"{AGENT_DIR}/{expert}-bc")
+  return agent, train_losses, test_losses, expert_data
+
+
+def train_dagger_agent(expert_policy_file, config):
+  # Get the actions that the expert would do given the observations
+  expert = load_policy(expert_policy_file)
+
+  agent, train_losses, test_losses, dataset = train_bc_agent(expert_policy_file, config)
+
+  for i in range(config.num_dagger_iterations):
+    # Get observations using the policy we just trained
+    _, observations, _ = run_agent(agent_wrapper(agent, config), config)
+    actions = [expert(obs[None, :]) for obs in observations]
+
+    # Create a new training set that uses all the data
+    observations = torch.Tensor(observations).to(config.device)
+    actions = torch.Tensor(actions).squeeze(1).to(config.device)
+
+    dagger_data = data.TensorDataset(observations, actions)
+    dataset = data.ConcatDataset([dataset, dagger_data])
+
+    N = len(dataset)
+    train_length = int(config.split * N)
+    test_length = N - train_length
+
+    trainset, valset = data.random_split(dataset, [train_length, test_length])
+
+    train_loader = data.DataLoader(trainset, batch_size=128, shuffle=True)
+    test_loader = data.DataLoader(valset, batch_size=128)
+
+    train_loss, test_loss = train_epochs(agent, train_loader, test_loader, epochs=config.epochs, lr=config.lr)
+
+    train_losses += train_loss
+    test_losses += test_loss
 
   return agent, train_losses, test_losses
-
-
-class ExpertData(data.Dataset):
-  def __init__(self, expert):
-    with open(f"./expert_data/{expert}.pkl", 'rb') as data:
-      expert_data = pickle.load(data)
-
-    self.observations = expert_data['observations']
-    self.actions = expert_data['actions']
-
-  def __len__(self):
-    return self.observations.shape[0]
-
-  def __getitem__(self, index):
-    x = torch.Tensor(self.observations[index]).contiguous()
-    y = torch.Tensor(self.actions[index])
-
-    return x, y.squeeze(0)
 
 
 def train_epochs(model, train_loader, test_loader, epochs=40, optimizer=None, lr=1e-4, loss_func=F.mse_loss):
